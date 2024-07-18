@@ -3,17 +3,108 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torchmetrics import Accuracy
+import torch.nn as nn
 import hydra
 from omegaconf import DictConfig
 import wandb
 from termcolor import cprint
 from tqdm import tqdm
+import torchvision.transforms as transforms
+import torch.optim.lr_scheduler as lr_scheduler
 
 from src.datasets import ThingsMEGDataset
-from src.models import BasicConvClassifier
+from src.models import TransformerClassifier
 from src.utils import set_seed
 
+# torch.log(0)によるnanを防ぐための関数
+def torch_log(x):
+    return torch.log(torch.clamp(x, min=1e-10))
+#前処理の定義
+import scipy.signal
 
+def bandpass_filter(data, lowcut, highcut, fs, order=5):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = scipy.signal.butter(order, [low, high], btype='band')
+    y = scipy.signal.lfilter(b, a, data)
+    return y
+from sklearn.decomposition import FastICA
+
+
+  
+import torch
+
+def normalize(data):
+    mean = data.mean(dim=0, keepdim=True)
+    std = data.std(dim=0, keepdim=True)
+    return (data - mean) / std
+
+def augment(data):
+    # 時間シフト
+    shift = np.random.randint(1, data.shape[1])
+    augmented_data = torch.roll(data, shifts=shift, dims=1)
+    # ガウスノイズ追加
+    noise = torch.randn_like(data) * 0.1
+    augmented_data += noise
+    return augmented_data
+def extract_features(data):
+    # FFT
+    fft_data = torch.fft.fft(data, dim=1)
+    # 絶対値を取って振幅スペクトルを取得
+    amplitude = torch.abs(fft_data)
+    return amplitude
+class MEGPreprocessing:
+    def __init__(self, lowcut, highcut, fs, order=5, augment=False):
+        self.lowcut = lowcut
+        self.highcut = highcut
+        self.fs = fs
+        self.order = order
+        self.augment = augment
+
+    def __call__(self, data):
+        data = bandpass_filter(data, self.lowcut, self.highcut, self.fs, self.order)
+        data = normalize(data)
+        if self.augment:
+            data = augment(data)
+        data = extract_features(data)
+        return data
+
+
+class EarlyStopping:
+    def __init__(self, patience=10, delta=0):
+        self.patience = patience
+        self.delta = delta
+        self.best_score = None
+        self.early_stop = False
+        self.counter = 0
+        self.best_loss = np.Inf
+
+    def __call__(self, val_loss, model, model_path):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model, model_path)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            print("count_up",self.counter)
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model, model_path)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model, model_path):
+        '''Saves model when validation loss decreases.'''
+        self.best_loss = val_loss
+        torch.save(model.state_dict(), model_path)
+def weights_init(m):
+    if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
+        nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def run(args: DictConfig):
     set_seed(args.seed)
@@ -21,17 +112,19 @@ def run(args: DictConfig):
     
     if args.use_wandb:
         wandb.init(mode="online", dir=logdir, project="MEG-classification")
-
+   
     # ------------------
     #    Dataloader
     # ------------------
     loader_args = {"batch_size": args.batch_size, "num_workers": args.num_workers}
     
-    train_set = ThingsMEGDataset("train", args.data_dir)
+    train_transform = MEGPreprocessing(lowcut=1, highcut=40, fs=1000, order=5, augment=True)
+    val_test_transform = MEGPreprocessing(lowcut=1, highcut=40, fs=1000, order=5, augment=False)
+    train_set = ThingsMEGDataset("train", args.data_dir, transform=train_transform)
     train_loader = torch.utils.data.DataLoader(train_set, shuffle=True, **loader_args)
-    val_set = ThingsMEGDataset("val", args.data_dir)
+    val_set = ThingsMEGDataset("val", args.data_dir, transform=val_test_transform)
     val_loader = torch.utils.data.DataLoader(val_set, shuffle=False, **loader_args)
-    test_set = ThingsMEGDataset("test", args.data_dir)
+    test_set = ThingsMEGDataset("test", args.data_dir, transform=val_test_transform)
     test_loader = torch.utils.data.DataLoader(
         test_set, shuffle=False, batch_size=args.batch_size, num_workers=args.num_workers
     )
@@ -39,14 +132,26 @@ def run(args: DictConfig):
     # ------------------
     #       Model
     # ------------------
-    model = BasicConvClassifier(
-        train_set.num_classes, train_set.seq_len, train_set.num_channels
+    model = TransformerClassifier(
+        num_classes=train_set.num_classes, seq_len = train_set.seq_len, in_channels=train_set.num_channels
     ).to(args.device)
-
+    # 重みの初期化
+    model.apply(weights_init)
     # ------------------
     #     Optimizer
     # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    # ------------------
+    #  Learning Rate Scheduler
+    # ------------------
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2, min_lr=1e-6, verbose=True)
+
+    # ------------------
+    #  Early Stopping
+    # ------------------
+    early_stopping = EarlyStopping(patience=10, delta=0.001)
+    best_model_path = os.path.join(logdir, "model_best.pt")
 
     # ------------------
     #   Start training
@@ -64,14 +169,20 @@ def run(args: DictConfig):
         model.train()
         for X, y, subject_idxs in tqdm(train_loader, desc="Train"):
             X, y = X.to(args.device), y.to(args.device)
-
+            
+            optimizer.zero_grad()
             y_pred = model(X)
             
             loss = F.cross_entropy(y_pred, y)
             train_loss.append(loss.item())
             
-            optimizer.zero_grad()
+            
             loss.backward()
+            for param in model.parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        raise ValueError("Gradients contain NaNs or Infs")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             acc = accuracy(y_pred, y)
@@ -83,11 +194,14 @@ def run(args: DictConfig):
             
             with torch.no_grad():
                 y_pred = model(X)
-            
+            #print("y_pred",y_pred)
             val_loss.append(F.cross_entropy(y_pred, y).item())
             val_acc.append(accuracy(y_pred, y).item())
-
         print(f"Epoch {epoch+1}/{args.epochs} | train loss: {np.mean(train_loss):.3f} | train acc: {np.mean(train_acc):.3f} | val loss: {np.mean(val_loss):.3f} | val acc: {np.mean(val_acc):.3f}")
+        
+        # 学習率スケジューラのステップを実行
+        scheduler.step(np.mean(val_loss))
+
         torch.save(model.state_dict(), os.path.join(logdir, "model_last.pt"))
         if args.use_wandb:
             wandb.log({"train_loss": np.mean(train_loss), "train_acc": np.mean(train_acc), "val_loss": np.mean(val_loss), "val_acc": np.mean(val_acc)})
@@ -96,12 +210,18 @@ def run(args: DictConfig):
             cprint("New best.", "cyan")
             torch.save(model.state_dict(), os.path.join(logdir, "model_best.pt"))
             max_val_acc = np.mean(val_acc)
-            
-    
+        
+        # 早期停止のチェック
+        early_stopping(np.mean(val_loss), model, best_model_path)
+        
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
     # ----------------------------------
     #  Start evaluation with best model
     # ----------------------------------
-    model.load_state_dict(torch.load(os.path.join(logdir, "model_best.pt"), map_location=args.device))
+    model.load_state_dict(torch.load(best_model_path, map_location=args.device))
 
     preds = [] 
     model.eval()
